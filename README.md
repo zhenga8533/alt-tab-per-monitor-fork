@@ -14,6 +14,11 @@ It makes Alt+Tab show only the windows on the monitor where the cursor is.
   terminal with a running CLI, showed up on every monitor.
 - Uses the monitor the cursor was on when Alt+Tab opened, instead of checking
   the cursor position again on every call.
+- Adds a "Current monitor" setting: the monitor under the cursor, or the
+  monitor of the focused window.
+- Can show all windows when the current monitor has none.
+- Adds an "Always show apps" list of apps that appear in Alt+Tab on every
+  monitor.
 
 ## Install
 

@@ -1,29 +1,39 @@
 // ==WindhawkMod==
 // @id              alt-tab-per-monitor-fork
 // @name            Alt+Tab per monitor - Fork
-// @description     Pressing Alt+Tab shows all open windows on the primary display. This mod shows only the windows on the monitor where the cursor is.
-// @version         1.3
-// @author          L3r0y
-// @github          https://github.com/L3r0yThingz
+// @description     Pressing Alt+Tab shows all open windows on the primary display. This mod shows only the windows on the current monitor.
+// @version         1.4
+// @author          zhenga8533
+// @github          https://github.com/zhenga8533
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -lole32 -loleaut32 -lversion
+// @compilerOptions -ldwmapi -lole32 -loleaut32 -lversion
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
 
 /*
-**# Alt+Tab per monitor**
+**# Alt+Tab per monitor - Fork**
+
+A fork of [Alt+Tab per monitor](https://windhawk.net/mods/alt-tab-per-monitor)
+by L3r0y.
 
 By default, pressing Alt+Tab shows all open windows on the primary display. This
-mod customizes the behavior so that Alt+Tab displays the switcher on the monitor
-where the cursor is located, showing only the windows on that monitor.
+mod customizes the behavior so that Alt+Tab displays the switcher on the current
+monitor, showing only the windows on that monitor. The current monitor is either
+the monitor where the cursor is located or the monitor of the focused window.
 
 Both Alt+Tab and Win+Alt+Tab can be independently configured with:
-\- ****Display location****: Primary monitor or monitor where cursor is located.
-\- ****Windows to show****: All monitors, cursor's monitor only, or cursor's monitor
-  with an exception for the primary monitor (shows all windows when cursor is on
-  the primary monitor).
+\- ****Display location****: Primary monitor or current monitor.
+\- ****Windows to show****: All monitors, current monitor only, or current monitor
+  with an exception for the primary monitor (shows all windows when the current
+  monitor is the primary monitor).
+
+Additionally:
+\- If the current monitor has no windows, all windows can be shown instead.
+\- Apps can be listed to always show in Alt+Tab, regardless of their monitor.
+  UWP apps are hosted by `ApplicationFrameHost.exe`, so they can't be matched by
+  their own process name.
 
 ![Gif](https://i.imgur.com/Hpg8TKh.gif)
 */
@@ -33,21 +43,28 @@ Both Alt+Tab and Win+Alt+Tab can be independently configured with:
 // ==WindhawkModSettings==
 
 /*
+- currentMonitor: cursor
+  $name: Current monitor
+  $description: Choose which monitor is considered the current monitor
+  $options:
+  - cursor: Monitor where cursor is located
+  - foregroundWindow: Monitor of the focused window
+
 - altTabLocation: cursor
   $name: "Alt+Tab: Display location"
   $description: Choose which monitor the Alt+Tab switcher appears on
   $options:
-  - cursor: Monitor where cursor is located
+  - cursor: Current monitor
   - primary: Primary monitor
 
 - altTabWindows: cursorMonitor
   $name: "Alt+Tab: Windows to show"
   $description: Choose which windows to show when using Alt+Tab
   $options:
-  - cursorMonitor: Windows from the monitor where cursor is located
+  - cursorMonitor: Windows from the current monitor
   - allMonitors: Windows from all monitors
   - cursorMonitorExceptPrimary: >-
-      Windows from cursor's monitor, but all windows when on primary
+      Windows from the current monitor, but all windows when on primary
 
 - winAltTabLocation: primary
   $name: "Win+Alt+Tab: Display location"
@@ -55,43 +72,69 @@ Both Alt+Tab and Win+Alt+Tab can be independently configured with:
     Choose which monitor the Alt+Tab switcher appears on when using Win+Alt+Tab
   $options:
   - primary: Primary monitor
-  - cursor: Monitor where cursor is located
+  - cursor: Current monitor
 
 - winAltTabWindows: allMonitors
   $name: "Win+Alt+Tab: Windows to show"
   $description: Choose which windows to show when using Win+Alt+Tab
   $options:
   - allMonitors: Windows from all monitors
-  - cursorMonitor: Windows from the monitor where cursor is located
+  - cursorMonitor: Windows from the current monitor
   - cursorMonitorExceptPrimary: >-
-      Windows from cursor's monitor, but all windows when on primary
+      Windows from the current monitor, but all windows when on primary
+
+- showAllWhenMonitorEmpty: true
+  $name: Show all windows when the current monitor has none
+  $description: >-
+    Instead of an empty switcher, show windows from all monitors
+
+- alwaysShowApps: [""]
+  $name: Always show apps
+  $description: >-
+    Process names (e.g. spotify.exe) or full paths of apps that are always
+    shown in Alt+Tab, regardless of their monitor
 */
 
 // ==/WindhawkModSettings==
 
 #include <windhawk_utils.h>
+#include <dwmapi.h>
 #include <atomic>
 #include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
 
 #include <winrt/windows.foundation.collections.h>
 
+enum class CurrentMonitor {
+    cursor,
+    foregroundWindow,
+};
+
 enum class Location {
     primary,
-    cursor,
+    currentMonitor,
 };
 
 enum class WindowsToShow {
     allMonitors,
-    cursorMonitor,
-    cursorMonitorExceptPrimary,
+    currentMonitor,
+    currentMonitorExceptPrimary,
 };
 
 struct {
+    CurrentMonitor currentMonitor;
     Location altTabLocation;
     WindowsToShow altTabWindows;
     Location winAltTabLocation;
     WindowsToShow winAltTabWindows;
+    bool showAllWhenMonitorEmpty;
 } g_settings;
+
+std::mutex g_alwaysShowAppsMutex;
+std::shared_ptr<const std::vector<std::wstring>> g_alwaysShowApps;
 
 enum class WinVersion {
     Unsupported,
@@ -101,9 +144,9 @@ enum class WinVersion {
 
 WinVersion g_winVersion;
 std::atomic<DWORD> g_threadIdForAltTabShowWindow;
-std::atomic<DWORD> g_lastThreadIdForXamlAltTabViewHost_CreateInstance;
-std::atomic<DWORD> g_threadIdForXamlAltTabViewHost_CreateInstance;
-std::atomic<ULONGLONG> g_CreateInstance_TickCount;
+std::atomic<DWORD> g_altTabThreadId;
+std::atomic<DWORD> g_altTabCreatingThreadId;
+std::atomic<ULONGLONG> g_altTabCreatedTickCount;
 std::atomic<HMONITOR> g_altTabMonitor;
 std::atomic<bool> g_altTabOpen;
 bool g_dismissViewHooked;
@@ -169,6 +212,149 @@ bool IsWinKeyPressed() {
     return GetAsyncKeyState(VK_LWIN) < 0 || GetAsyncKeyState(VK_RWIN) < 0;
 }
 
+bool IsDesktopWindow(HWND windowHandle) {
+    WCHAR className[32];
+
+    if (!GetClassName(windowHandle, className, ARRAYSIZE(className))) {
+        return false;
+    }
+
+    return wcscmp(className, L"Progman") == 0 ||
+           wcscmp(className, L"WorkerW") == 0;
+}
+
+HMONITOR GetCurrentMonitor() {
+    if (g_settings.currentMonitor == CurrentMonitor::foregroundWindow) {
+        HWND foregroundWindow = GetForegroundWindow();
+
+        // With the desktop focused, there's no meaningful window monitor, so
+        // fall back to the cursor.
+        if (foregroundWindow && !IsDesktopWindow(foregroundWindow)) {
+            return MonitorFromWindow(foregroundWindow,
+                                     MONITOR_DEFAULTTONEAREST);
+        }
+    }
+
+    POINT pt;
+
+    if (!GetCursorPos(&pt)) {
+        return nullptr;
+    }
+
+    return MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+}
+
+bool IsPrimaryMonitor(HMONITOR monitor) {
+    MONITORINFO monInfo;
+    monInfo.cbSize = sizeof(MONITORINFO);
+
+    return GetMonitorInfo(monitor, &monInfo) &&
+           (monInfo.dwFlags & MONITORINFOF_PRIMARY);
+}
+
+// Approximates the rules Alt+Tab uses to decide which windows to list.
+bool IsAltTabCandidate(HWND windowHandle) {
+    if (!IsWindowVisible(windowHandle) || IsDesktopWindow(windowHandle)) {
+        return false;
+    }
+
+    LONG_PTR exStyle = GetWindowLongPtr(windowHandle, GWL_EXSTYLE);
+
+    if (exStyle & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) {
+        return false;
+    }
+
+    if (GetWindow(windowHandle, GW_OWNER) && !(exStyle & WS_EX_APPWINDOW)) {
+        return false;
+    }
+
+    // Windows on other virtual desktops are cloaked.
+    BOOL cloaked = FALSE;
+
+    if (SUCCEEDED(DwmGetWindowAttribute(windowHandle, DWMWA_CLOAKED, &cloaked,
+                                        sizeof(cloaked))) &&
+        cloaked) {
+        return false;
+    }
+
+    return true;
+}
+
+bool MonitorHasAltTabWindows(HMONITOR monitor) {
+    struct Context {
+        HMONITOR monitor;
+        bool found;
+    } context{monitor, false};
+
+    EnumWindows(
+        [](HWND windowHandle, LPARAM lParam) -> BOOL {
+            auto* context = reinterpret_cast<Context*>(lParam);
+
+            if (IsAltTabCandidate(windowHandle) &&
+                MonitorFromWindow(windowHandle, MONITOR_DEFAULTTONEAREST) ==
+                    context->monitor) {
+                context->found = true;
+                return FALSE;
+            }
+
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&context));
+
+    return context.found;
+}
+
+std::wstring GetWindowProcessPath(HWND windowHandle) {
+    DWORD processId = 0;
+    GetWindowThreadProcessId(windowHandle, &processId);
+
+    HANDLE process =
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+
+    if (!process) {
+        return {};
+    }
+
+    WCHAR path[MAX_PATH];
+    DWORD pathSize = ARRAYSIZE(path);
+    BOOL succeeded = QueryFullProcessImageName(process, 0, path, &pathSize);
+    CloseHandle(process);
+
+    return succeeded ? std::wstring(path, pathSize) : std::wstring();
+}
+
+bool IsAlwaysShownApp(HWND windowHandle) {
+    std::shared_ptr<const std::vector<std::wstring>> alwaysShowApps;
+
+    {
+        std::lock_guard<std::mutex> lock(g_alwaysShowAppsMutex);
+        alwaysShowApps = g_alwaysShowApps;
+    }
+
+    if (!alwaysShowApps || alwaysShowApps->empty()) {
+        return false;
+    }
+
+    std::wstring path = GetWindowProcessPath(windowHandle);
+
+    if (path.empty()) {
+        return false;
+    }
+
+    PCWSTR fileName = wcsrchr(path.c_str(), L'\\');
+    fileName = fileName ? fileName + 1 : path.c_str();
+
+    for (const auto& app : *alwaysShowApps) {
+        PCWSTR target = wcschr(app.c_str(), L'\\') ? path.c_str() : fileName;
+
+        if (_wcsicmp(app.c_str(), target) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool HandleAltTabWindow(RECT* rect) {
     auto location = IsWinKeyPressed() ? g_settings.winAltTabLocation
                                       : g_settings.altTabLocation;
@@ -177,13 +363,11 @@ bool HandleAltTabWindow(RECT* rect) {
         return false;
     }
 
-    POINT pt;
+    HMONITOR hMon = g_altTabMonitor;
 
-    if (!GetCursorPos(&pt)) {
+    if (!hMon) {
         return false;
     }
-
-    auto hMon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
 
     MONITORINFO monInfo;
     monInfo.cbSize = sizeof(MONITORINFO);
@@ -226,15 +410,16 @@ HRESULT GetWindowHandleFromApplicationView(void* applicationView,
     return hr;
 }
 
-bool IsWindowOnAltTabMonitor(HWND windowHandle) {
+bool ShouldShowWindow(HWND windowHandle) {
     return MonitorFromWindow(windowHandle, MONITOR_DEFAULTTONEAREST) ==
-           g_altTabMonitor;
+               g_altTabMonitor ||
+           IsAlwaysShownApp(windowHandle);
 }
 
 bool ShouldFilterViewVisibility() {
     DWORD threadId = GetCurrentThreadId();
 
-    if (g_threadIdForXamlAltTabViewHost_CreateInstance == threadId) {
+    if (g_altTabCreatingThreadId == threadId) {
         return true;
     }
 
@@ -242,12 +427,12 @@ bool ShouldFilterViewVisibility() {
     // that becomes active or flashes while Alt+Tab is open. Keep filtering on
     // the Alt+Tab thread until it's dismissed. Calls from other threads are left
     // alone, as the same function is also used by the taskbar and Win+Tab.
-    if (g_lastThreadIdForXamlAltTabViewHost_CreateInstance != threadId) {
+    if (g_altTabThreadId != threadId) {
         return false;
     }
 
     return g_altTabOpen ||
-           (GetTickCount64() - g_CreateInstance_TickCount) <= kDeltaThreshold;
+           (GetTickCount64() - g_altTabCreatedTickCount) <= kDeltaThreshold;
 }
 
 using CVirtualDesktop_IsViewVisible_t = HRESULT(WINAPI*)(void* pThis,
@@ -258,8 +443,6 @@ CVirtualDesktop_IsViewVisible_t CVirtualDesktop_IsViewVisible_Original;
 HRESULT WINAPI CVirtualDesktop_IsViewVisible_Hook(void* pThis,
                                                   void* applicationView,
                                                   BOOL* isVisible) {
-    Wh_Log(L">");
-
     auto ret = CVirtualDesktop_IsViewVisible_Original(pThis, applicationView,
                                                       isVisible);
 
@@ -276,7 +459,8 @@ HRESULT WINAPI CVirtualDesktop_IsViewVisible_Hook(void* pThis,
         return ret;
     }
 
-    if (!IsWindowOnAltTabMonitor(windowHandle)) {
+    if (!ShouldShowWindow(windowHandle)) {
+        Wh_Log(L"Hiding window %p", windowHandle);
         *isVisible = FALSE;
     }
 
@@ -402,40 +586,36 @@ HRESULT CreateInstanceHook(std::function<HRESULT()> original) {
     auto windows = IsWinKeyPressed() ? g_settings.winAltTabWindows
                                      : g_settings.altTabWindows;
 
-    HMONITOR cursorMonitor = nullptr;
-    POINT pt;
+    HMONITOR monitor = GetCurrentMonitor();
+    g_altTabMonitor = monitor;
 
-    if (GetCursorPos(&pt)) {
-        cursorMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    bool filter = windows != WindowsToShow::allMonitors && monitor;
+
+    if (filter && windows == WindowsToShow::currentMonitorExceptPrimary &&
+        IsPrimaryMonitor(monitor)) {
+        filter = false;
     }
 
-    bool filter = windows != WindowsToShow::allMonitors && cursorMonitor;
-
-    if (filter && windows == WindowsToShow::cursorMonitorExceptPrimary) {
-        MONITORINFO monInfo;
-        monInfo.cbSize = sizeof(MONITORINFO);
-
-        if (GetMonitorInfo(cursorMonitor, &monInfo) &&
-            (monInfo.dwFlags & MONITORINFOF_PRIMARY)) {
-            filter = false;
-        }
+    if (filter && g_settings.showAllWhenMonitorEmpty &&
+        !MonitorHasAltTabWindows(monitor)) {
+        Wh_Log(L"No windows on the current monitor, showing all windows");
+        filter = false;
     }
 
     if (!filter) {
-        g_lastThreadIdForXamlAltTabViewHost_CreateInstance = 0;
+        g_altTabThreadId = 0;
         g_altTabOpen = false;
 
         return original();
     }
 
-    g_altTabMonitor = cursorMonitor;
-    g_threadIdForXamlAltTabViewHost_CreateInstance = GetCurrentThreadId();
-    g_lastThreadIdForXamlAltTabViewHost_CreateInstance = GetCurrentThreadId();
-    g_CreateInstance_TickCount = GetTickCount64();
+    g_altTabCreatingThreadId = GetCurrentThreadId();
+    g_altTabThreadId = GetCurrentThreadId();
+    g_altTabCreatedTickCount = GetTickCount64();
     g_altTabOpen = g_dismissViewHooked;
 
     HRESULT ret = original();
-    g_threadIdForXamlAltTabViewHost_CreateInstance = 0;
+    g_altTabCreatingThreadId = 0;
 
     return ret;
 }
@@ -528,6 +708,21 @@ HRESULT WINAPI CAltTabViewHost_CreateInstance_Win11_Hook(void* pThis,
 }
 
 void LoadSettings() {
+    auto loadCurrentMonitor = [](PCWSTR name, CurrentMonitor defaultVal) {
+        PCWSTR val = Wh_GetStringSetting(name);
+        CurrentMonitor result = defaultVal;
+
+        if (wcscmp(val, L"cursor") == 0) {
+            result = CurrentMonitor::cursor;
+        } else if (wcscmp(val, L"foregroundWindow") == 0) {
+            result = CurrentMonitor::foregroundWindow;
+        }
+
+        Wh_FreeStringSetting(val);
+
+        return result;
+    };
+
     auto loadLocation = [](PCWSTR name, Location defaultVal) {
         PCWSTR val = Wh_GetStringSetting(name);
         Location result = defaultVal;
@@ -535,7 +730,7 @@ void LoadSettings() {
         if (wcscmp(val, L"primary") == 0) {
             result = Location::primary;
         } else if (wcscmp(val, L"cursor") == 0) {
-            result = Location::cursor;
+            result = Location::currentMonitor;
         }
 
         Wh_FreeStringSetting(val);
@@ -550,23 +745,47 @@ void LoadSettings() {
         if (wcscmp(val, L"allMonitors") == 0) {
             result = WindowsToShow::allMonitors;
         } else if (wcscmp(val, L"cursorMonitor") == 0) {
-            result = WindowsToShow::cursorMonitor;
+            result = WindowsToShow::currentMonitor;
         } else if (wcscmp(val, L"cursorMonitorExceptPrimary") == 0) {
-            result = WindowsToShow::cursorMonitorExceptPrimary;
+            result = WindowsToShow::currentMonitorExceptPrimary;
         }
 
         Wh_FreeStringSetting(val);
 
         return result;
     };
+    g_settings.currentMonitor =
+        loadCurrentMonitor(L"currentMonitor", CurrentMonitor::cursor);
     g_settings.altTabLocation =
-        loadLocation(L"altTabLocation", Location::cursor);
+        loadLocation(L"altTabLocation", Location::currentMonitor);
     g_settings.altTabWindows =
-        loadWindows(L"altTabWindows", WindowsToShow::cursorMonitor);
+        loadWindows(L"altTabWindows", WindowsToShow::currentMonitor);
     g_settings.winAltTabLocation =
         loadLocation(L"winAltTabLocation", Location::primary);
     g_settings.winAltTabWindows =
         loadWindows(L"winAltTabWindows", WindowsToShow::allMonitors);
+    g_settings.showAllWhenMonitorEmpty =
+        Wh_GetIntSetting(L"showAllWhenMonitorEmpty");
+
+    auto alwaysShowApps = std::make_shared<std::vector<std::wstring>>();
+
+    for (int i = 0;; i++) {
+        PCWSTR app = Wh_GetStringSetting(L"alwaysShowApps[%d]", i);
+        bool hasApp = *app;
+
+        if (hasApp) {
+            alwaysShowApps->emplace_back(app);
+        }
+
+        Wh_FreeStringSetting(app);
+
+        if (!hasApp) {
+            break;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_alwaysShowAppsMutex);
+    g_alwaysShowApps = std::move(alwaysShowApps);
 }
 
 BOOL Wh_ModInit() {
